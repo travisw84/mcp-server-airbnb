@@ -102,10 +102,46 @@ const AIRBNB_SEARCH_TOOL: Tool = {
             "pool", "hot_tub", "exercise_equipment",
             "free_parking",
             "smoke_alarm", "carbon_monoxide_alarm",
-            "crib", "high_chair"
+            "crib", "high_chair", "king_bed", "self_checkin"
           ]
         },
         description: "Required amenities. Each value maps to an Airbnb amenity ID and is sent as &amenities[]=<id> on the search URL, so Airbnb filters at the source. Listings missing any of these are excluded from the response."
+      },
+      instantBook: {
+        type: "boolean",
+        description: "Filter to listings with Instant Book enabled (no host approval needed)."
+      },
+      guestFavorite: {
+        type: "boolean",
+        description: "Filter to Airbnb's curated 'Guest favorite' quality bucket."
+      },
+      minBedrooms: {
+        type: "number",
+        description: "Minimum number of bedrooms."
+      },
+      minBeds: {
+        type: "number",
+        description: "Minimum number of beds (any type — to filter by type use amenities, e.g. ['king_bed'])."
+      },
+      minBathrooms: {
+        type: "number",
+        description: "Minimum number of bathrooms."
+      },
+      ne_lat: {
+        type: "number",
+        description: "Manual bounding-box override: northeast latitude. Provide all four bbox values together (ne_lat, ne_lng, sw_lat, sw_lng) to skip the third-party geocoder for this request."
+      },
+      ne_lng: {
+        type: "number",
+        description: "Manual bounding-box override: northeast longitude. See ne_lat."
+      },
+      sw_lat: {
+        type: "number",
+        description: "Manual bounding-box override: southwest latitude. See ne_lat."
+      },
+      sw_lng: {
+        type: "number",
+        description: "Manual bounding-box override: southwest longitude. See ne_lat."
       },
       ignoreRobotsText: {
         type: "boolean",
@@ -341,6 +377,7 @@ const ROOM_TYPE_LABELS: Record<string, string> = {
   hotel_room:   "Hotel room",
 };
 
+
 // Configuration from environment variables (set by DXT host)
 const IGNORE_ROBOTS_TXT = process.env.IGNORE_ROBOTS_TXT === "true" || process.argv.slice(2).includes("--ignore-robots-txt");
 // When true, skip the Photon/Nominatim geocoding step and let Airbnb's own
@@ -526,6 +563,15 @@ async function handleAirbnbSearch(params: any) {
     cursor,
     propertyType,
     amenities,
+    instantBook,
+    guestFavorite,
+    minBedrooms,
+    minBeds,
+    minBathrooms,
+    ne_lat,
+    ne_lng,
+    sw_lat,
+    sw_lng,
     ignoreRobotsText = false,
     compact = false,
   } = params;
@@ -541,11 +587,21 @@ async function handleAirbnbSearch(params: any) {
   
   // Add placeId
   if (placeId) searchUrl.searchParams.append("place_id", placeId);
-  
+
+  // Manual bounding-box override: agent supplied all four corners directly.
+  const manualBbox =
+    ne_lat != null && ne_lng != null && sw_lat != null && sw_lng != null;
+  if (manualBbox) {
+    searchUrl.searchParams.append("ne_lat", String(ne_lat));
+    searchUrl.searchParams.append("ne_lng", String(ne_lng));
+    searchUrl.searchParams.append("sw_lat", String(sw_lat));
+    searchUrl.searchParams.append("sw_lng", String(sw_lng));
+  }
+
   // Geocode and add bounding box to fix broken server-side geocoding.
-  // Skipped when placeId is supplied (Airbnb's place lookup is reliable for those)
-  // or when DISABLE_GEOCODING=true (user opt-out from third-party calls).
-  if (!placeId && !DISABLE_GEOCODING) {
+  // Skipped when placeId is supplied (Airbnb's place lookup is reliable for those),
+  // when a manual bbox was supplied, or when DISABLE_GEOCODING=true.
+  if (!placeId && !manualBbox && !DISABLE_GEOCODING) {
     const coords = await geocodeLocation(location);
     if (coords) {
       searchUrl.searchParams.append("ne_lat", coords.ne_lat);
@@ -591,6 +647,15 @@ async function handleAirbnbSearch(params: any) {
       }
     }
   }
+
+  // Quality / booking filters
+  if (instantBook) searchUrl.searchParams.append("ib", "true");
+  if (guestFavorite) searchUrl.searchParams.append("guest_favorite", "true");
+
+  // Minimum room/bed counts
+  if (minBedrooms != null) searchUrl.searchParams.append("min_bedrooms", String(minBedrooms));
+  if (minBeds != null) searchUrl.searchParams.append("min_beds", String(minBeds));
+  if (minBathrooms != null) searchUrl.searchParams.append("min_bathrooms", String(minBathrooms));
 
   // Add cursor for pagination
   if (cursor) {
