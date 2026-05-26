@@ -142,6 +142,7 @@ Search for Airbnb listings with comprehensive filtering options.
 - `maxPrice` (optional): Maximum price per night
 - `cursor` (optional): Pagination cursor for browsing results
 - `propertyType` (optional): Filter by property type — `entire_home`, `private_room`, `shared_room`, or `hotel_room`
+- `amenities` (optional): Array of required amenities. Each value is mapped to the Airbnb amenity ID Airbnb's search URL accepts as `amenities[]=N`, so the filter is applied server-side. Supported values: `air_conditioning`, `washer`, `dryer`, `wifi`, `tv`, `heating`, `pool`, `workspace`. To extend the list, open the Airbnb filters panel in a browser, tick the desired amenity, and read the new ID from the URL.
 - `ignoreRobotsText` (optional): Override robots.txt for this request
 
 **Returns:**
