@@ -933,6 +933,22 @@ async function handleAirbnbListingDetails(params: any) {
         }
       }
     },
+    "REVIEWS_DEFAULT": {
+      overallRating: true,
+      overallCount: true,
+      isGuestFavorite: true,
+      ratings: {
+        categoryType: true,
+        localizedRating: true,
+        label: true,
+        percentage: true
+      },
+      ratingDistribution: {
+        label: true,
+        percentage: true,
+        starCount: true
+      }
+    },
     //"AVAILABLITY_CALENDAR_DEFAULT": true,
   };
 
