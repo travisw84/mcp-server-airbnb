@@ -92,7 +92,18 @@ const AIRBNB_SEARCH_TOOL: Tool = {
         type: "array",
         items: {
           type: "string",
-          enum: ["air_conditioning", "washer", "dryer", "wifi", "tv", "heating", "pool", "workspace"]
+          enum: [
+            "air_conditioning", "heating",
+            "wifi", "tv",
+            "washer", "dryer",
+            "workspace", "dining_table",
+            "kitchen", "microwave", "coffee_maker", "refrigerator", "dishwasher", "oven", "stove",
+            "bathtub", "hair_dryer", "iron", "hangers", "essentials",
+            "pool", "hot_tub", "exercise_equipment",
+            "free_parking",
+            "smoke_alarm", "carbon_monoxide_alarm",
+            "crib", "high_chair"
+          ]
         },
         description: "Required amenities. Each value maps to an Airbnb amenity ID and is sent as &amenities[]=<id> on the search URL, so Airbnb filters at the source. Listings missing any of these are excluded from the response."
       },
@@ -460,14 +471,44 @@ function assertNotDomainHandoff(html: string, url: string) {
 // tick the desired amenity in the filters panel, and copy the new ID from the
 // URL. Only IDs verified against public sources or live URLs are listed here.
 const AMENITY_IDS: Record<string, number> = {
+  // Climate
   air_conditioning: 5,
-  washer: 33,
-  dryer: 34,
+  heating: 30,
+  // Connectivity & entertainment
   wifi: 4,
   tv: 1,
-  heating: 30,
-  pool: 7,
+  // Laundry
+  washer: 33,
+  dryer: 34,
+  // Work & dining
   workspace: 47,
+  dining_table: 236,
+  // Kitchen
+  kitchen: 8,
+  microwave: 89,
+  coffee_maker: 90,
+  refrigerator: 91,
+  dishwasher: 92,
+  oven: 95,
+  stove: 96,
+  // Bath & essentials
+  bathtub: 61,
+  hair_dryer: 45,
+  iron: 46,
+  hangers: 44,
+  essentials: 40,
+  // Outdoor & wellness
+  pool: 7,
+  hot_tub: 25,
+  exercise_equipment: 227,
+  // Parking
+  free_parking: 9,
+  // Safety
+  smoke_alarm: 35,
+  carbon_monoxide_alarm: 36,
+  // Family
+  crib: 71,
+  high_chair: 64,
 };
 
 async function handleAirbnbSearch(params: any) {
