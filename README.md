@@ -273,11 +273,18 @@ npm run watch
 ### Testing
 
 ```bash
-# Build, then run all three suites
+# Build, then run the offline suite
 npm test
 ```
 
-`npm test` runs one offline unit suite, then drives the built server over stdio and calls the tools for real:
+`npm test` runs the fixture-backed unit suite under `test/*.test.mjs` — no network access, safe for CI and for every install.
+
+```bash
+# Build, then drive the built server over stdio against the real site
+npm run test:live
+```
+
+`npm run test:live` calls the tools for real:
 
 - `test-domain-handoff.js` — country-domain handoff detection against a captured stub, including the cases that must *not* be treated as a handoff. No network required
 - `test-extension.js` — MCP handshake, tool listing, a search, listing details, and the geocoding paths (Photon, Nominatim fallback)
