@@ -11,7 +11,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import fetch from "node-fetch";
 import * as cheerio from "cheerio";
-import { cleanObject, flattenArraysInObject, pickBySchema, diagnoseJsonPath, findPdpPresentation, extractAmenities, extractHighlights, keyAmenityGroups, detectDomainHandoff, normalizeBaseUrl, DEFAULT_BASE_URL, findNodeLocation, extractLocationCoordinate, recoverLocationSection, extractOccupancy, findBookingPrefetchData, extractCancellationPolicies, extractHouseRules } from "./util.js";
+import { cleanObject, flattenArraysInObject, pickBySchema, diagnoseJsonPath, findPdpPresentation, extractAmenities, extractHighlights, keyAmenityGroups, detectDomainHandoff, normalizeBaseUrl, DEFAULT_BASE_URL, findNodeLocation, extractLocationCoordinate, recoverLocationSection, extractOccupancy, findBookingPrefetchData, extractCancellationPolicies, extractHouseRules, extractHostInfo, extractBadgeType, searchBadgeSchema } from "./util.js";
 import robotsParser from "robots-parser";
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -535,9 +535,7 @@ async function handleAirbnbSearch(params: any) {
       description: true,
       location: true,
     },
-    badges: {
-      text: true,
-    },
+    badges: searchBadgeSchema,
     structuredContent: {
       mapCategoryInfo: {
         body: true
@@ -604,7 +602,15 @@ async function handleAirbnbSearch(params: any) {
       
       staysSearchResults = {
         searchResults: results.searchResults
-          .map((result: any) => flattenArraysInObject(pickBySchema(result, allowSearchResultSchema)))
+          .map((result: any) => {
+            // badgeType must be read before flatten collapses badges to a string.
+            // Same attach-after-flatten pattern as priceBreakdown: structured data
+            // rides alongside the card, never inside the flattened badges string.
+            const badgeType = extractBadgeType(result);
+            const flat = flattenArraysInObject(pickBySchema(result, allowSearchResultSchema));
+            if (badgeType) flat.badgeType = badgeType;
+            return flat;
+          })
           .map((result: any) => {
             const id = atob(result.demandStayListing.id).split(":")[1];
             return {id, url: `${BASE_URL}/rooms/${id}`, ...result }
@@ -878,6 +884,13 @@ async function handleAirbnbListingDetails(params: any) {
         const alreadyHadCoords = before && Number.isFinite(before.lat) && Number.isFinite(before.lng);
         extracted = recoverLocationSection(extracted, locationCoordinate);
         if (!alreadyHadCoords) recovered.push("LOCATION_DEFAULT");
+
+        // HOST is additive (MEET_YOUR_HOST is a stub). Superhost lives on passportData.
+        const host = extractHostInfo(pdp);
+        if (host && !extracted.some((s: any) => s.id === "HOST")) {
+          recovered.push("HOST");
+          extracted.push({ id: "HOST", ...host });
+        }
       }
 
       details = extracted;
