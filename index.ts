@@ -11,7 +11,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import fetch from "node-fetch";
 import * as cheerio from "cheerio";
-import { cleanObject, flattenArraysInObject, pickBySchema, diagnoseJsonPath, findPdpPresentation, extractAmenities, extractHighlights, keyAmenityGroups, detectDomainHandoff, normalizeBaseUrl, DEFAULT_BASE_URL, findNodeLocation, extractLocationCoordinate, recoverLocationSection, extractOccupancy, findBookingPrefetchData, extractCancellationPolicies, extractHouseRules, extractHostInfo, extractBadgeType, searchBadgeSchema } from "./util.js";
+import { cleanObject, flattenArraysInObject, pickBySchema, diagnoseJsonPath, findPdpPresentation, extractAmenities, extractHighlights, keyAmenityGroups, detectDomainHandoff, normalizeBaseUrl, DEFAULT_BASE_URL, findNodeLocation, extractLocationCoordinate, recoverLocationSection, extractOccupancy, findBookingPrefetchData, extractCancellationPolicies, extractHouseRules, extractHostInfo, extractBadgeType, searchBadgeSchema, extractMediaTour } from "./util.js";
 import robotsParser from "robots-parser";
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -891,6 +891,23 @@ async function handleAirbnbListingDetails(params: any) {
           recovered.push("HOST");
           extracted.push({ id: "HOST", ...host });
         }
+      }
+
+      // Photo tour: mediaTour, sleepingArrangements, and bathroomsTour are three
+      // sibling keys under pdpPresentation sharing one MediaTour shape. Unlike
+      // AMENITIES_DEFAULT/HIGHLIGHTS_DEFAULT above, none of these
+      // ever appear as a stubbed entry in the sections list - they are additive,
+      // not a stub to replace. The per-room amenity list is the primary payload
+      // (see extractMediaTour's docstring): it is what lets a caller catch a
+      // listing that claims N bedrooms while one "bedroom" stop is really a den.
+      const photoTourSections: Array<[string, any]> = [
+        ["PHOTO_TOUR", pdp?.mediaTour],
+        ["SLEEPING_ARRANGEMENTS_TOUR", pdp?.sleepingArrangements],
+        ["BATHROOMS_TOUR", pdp?.bathroomsTour],
+      ];
+      for (const [id, tour] of photoTourSections) {
+        const value = extractMediaTour(tour);
+        if (value) extracted.push({ id, ...value });
       }
 
       details = extracted;
