@@ -1,6 +1,6 @@
 {
-  "name": "@openbnb/mcp-server-airbnb",
-  "version": "0.3.0",
+  "name": "@traviswinsor84/mcp-server-airbnb",
+  "version": "0.4.0",
   "description": "MCP server for Airbnb search and listing details",
   "license": "MIT",
   "type": "module",
@@ -19,7 +19,10 @@
   "files": [
     "dist",
     "sync-version.js",
-    "!dist/*.mcpb"
+    "!dist/*.mcpb",
+    "skills",
+    "UPSTREAM.md",
+    "manifest.json"
   ],
   "scripts": {
     "build": "node sync-version.js && tsc && shx chmod +x dist/*.js",
@@ -27,20 +30,29 @@
     "prepare": "npm run build",
     "version": "node sync-version.js && git add manifest.json",
     "pretest": "npm run build",
-    "test": "node test-domain-handoff.js && node test-extension.js && node test-amenities.js",
+    "test": "node test-domain-handoff.js && node --test test/*.test.mjs",
+    "pretest:live": "npm run build",
+    "test:live": "node test-extension.js && node test-amenities.js",
     "watch": "tsc --watch",
-    "sync-version": "node sync-version.js"
+    "sync-version": "node sync-version.js",
+    "pack:release": "npm pack"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.1",
-    "cheerio": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "cheerio": "^1.2.0",
     "node-fetch": "^3.3.2",
     "robots-parser": "^3.0.1"
   },
   "devDependencies": {
-    "@types/node": "^22.13.9",
-    "@types/node-fetch": "^2.6.12",
-    "shx": "^0.3.4",
-    "typescript": "^5.8.2"
+    "@types/node": "^22.20.2",
+    "shx": "^0.4.0",
+    "typescript": "^7.0.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TravisWinsor84/mcp-server-airbnb.git"
+  },
+  "engines": {
+    "node": ">=22.0.0"
   }
 }

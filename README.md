@@ -1,324 +1,95 @@
-[![downloads](https://img.shields.io/npm/dm/@openbnb/mcp-server-airbnb)](https://www.npmjs.com/package/@openbnb/mcp-server-airbnb)
+# Airbnb read-only search MCP
 
-# Airbnb Search & Listings - MCP Bundle (MCPB)
+Personal maintained fork of OpenBnB, with selected upstream PRs and Daniel's
+listing recovery fixes. Includes the `airbnb-holiday-search` Codex skill.
+See [UPSTREAM.md](UPSTREAM.md) for included and deliberately omitted changes.
 
-A comprehensive MCP Bundle for searching Airbnb listings with advanced filtering capabilities and detailed property information retrieval. Built as a Model Context Protocol (MCP) server packaged in the MCP Bundle (MCPB) format for easy installation and use with compatible AI applications.
+## Install from source
 
----
+Requires Node.js 22 or later.
 
-## 🚀 Prefer not to run a local server? Try [openbnb.ai](https://openbnb.ai/)
-
-> **👉 [openbnb.ai](https://openbnb.ai/) is a hosted MCP server that solves the same problem — searching Airbnb listings — without any local setup.**
-
-If you don't want to deal with installing and running this server yourself, **[openbnb.ai](https://openbnb.ai/)** is a separate, fully-hosted alternative you can connect to directly from your MCP client. It goes beyond what this open-source server offers:
-
-- ✅ **Zero setup** — no Node, no `npx`, no config files, no updates to manage
-- ✅ **Advanced filters** — richer search controls beyond the base tools here
-- ✅ **MCP UI** — interactive UI components for browsing results, not just plain text
-- ✅ **Managed & maintained** — kept running for you
-
-Head to **[openbnb.ai](https://openbnb.ai/)** for setup instructions and the connection details for your MCP client.
-
-If you'd rather self-host the open-source server, read on.
-
----
-
-## Features
-
-### 🔍 Advanced Search Capabilities
-- **Location-based search** with support for cities, states, and regions
-- **International location support** via client-side geocoding, so non-US queries (e.g. "Paris, France", "Copenhagen, Denmark") return results in the right city
-- **Google Maps Place ID** integration for precise location targeting
-- **Property type filtering** for entire homes, private rooms, shared rooms, or hotel rooms
-- **Date filtering** with check-in and check-out date support
-- **Guest configuration** including adults, children, infants, and pets
-- **Price range filtering** with minimum and maximum price constraints
-- **Pagination support** for browsing through large result sets
-
-### 🏠 Detailed Property Information
-- **Comprehensive listing details** including amenities, policies, and highlights
-- **Location information** with coordinates and neighborhood details
-- **House rules and policies** for informed booking decisions
-- **Property descriptions** and key features
-- **Direct links** to Airbnb listings for easy booking
-
-### 🛡️ Security & Compliance
-- **Robots.txt compliance** with configurable override for testing
-- **Request timeout management** to prevent hanging requests
-- **Enhanced error handling** with detailed logging
-- **Rate limiting awareness** and respectful API usage
-- **Secure configuration** through MCPB user settings
-
-## Installation
-
-### For Claude Desktop
-This extension is packaged as an MCP Bundle (`.mcpb`) file. To install:
-
-1. Download the `.mcpb` file from the [latest release](https://github.com/openbnb-org/mcp-server-airbnb/releases/latest)
-2. Open the file — Claude Desktop will show an installation dialog
-3. Configure the extension settings as needed
-
-To ignore robots.txt, open Claude Desktop settings, navigate to the extension, and enable the **Ignore robots.txt** toggle.
-
-### For Cursor, etc.
-
-Before starting make sure [Node.js](https://nodejs.org/) is installed on your desktop for `npx` to work.
-1. Go to: Cursor Settings > Tools & Integrations > New MCP Server
-
-2. Add one the following to your `mcp.json`:
-    ```json
-    {
-      "mcpServers": {
-        "airbnb": {
-          "command": "npx",
-          "args": [
-            "-y",
-            "@openbnb/mcp-server-airbnb"
-          ]
-        }
-      }
-    }
-    ```
-
-    To ignore robots.txt for all requests, use this version with `--ignore-robots-txt` args
-
-    ```json
-    {
-      "mcpServers": {
-        "airbnb": {
-          "command": "npx",
-          "args": [
-            "-y",
-            "@openbnb/mcp-server-airbnb",
-            "--ignore-robots-txt"
-          ]
-        }
-      }
-    }
-    ```
-3. Restart.
-
-
-## Configuration
-
-The extension provides the following user-configurable options:
-
-### Ignore robots.txt
-- **Type**: Boolean (checkbox)
-- **Default**: `false`
-- **Description**: Bypass robots.txt restrictions when making requests to Airbnb
-- **Recommendation**: Keep disabled unless needed for testing purposes
-
-### Disable third-party geocoding
-- **Type**: Boolean (checkbox)
-- **Environment variable**: `DISABLE_GEOCODING`
-- **Default**: `false`
-- **Description**: Skip the Photon/Nominatim geocoding step and let Airbnb resolve the location string on its own. Enabling this restores the pre-PR behavior — every search goes only to `airbnb.com`, no third-party calls.
-- **Recommendation**: Keep disabled unless you specifically need zero third-party outbound traffic. With it enabled, non-US searches could return incorrect results. See [External Services](#external-services).
-
-### Airbnb domain
-- **Type**: String
-- **Environment variable**: `AIRBNB_BASE_URL`
-- **Default**: `https://www.airbnb.com`
-- **Description**: The Airbnb domain to query. Airbnb runs a per-country domain (`airbnb.co.uk`, `airbnb.fr`, …) and hands requests off to the one matching your request origin, so from some regions `www.airbnb.com` never returns a page the server can parse. Point this at your country domain to query it directly.
-- **Recommendation**: Leave unset unless searches fail with a domain-handoff error. See [Country domains](#country-domains).
-
-## Tools
-
-### `airbnb_search`
-
-Search for Airbnb listings with comprehensive filtering options.
-
-**Parameters:**
-- `location` (required): Location to search (e.g., "San Francisco, CA"). When supplied without `placeId`, the server geocodes this string client-side via Photon/Nominatim — see [External Services](#external-services).
-- `placeId` (optional): Google Maps Place ID. Overrides `location` and skips client-side geocoding entirely (no third-party calls).
-- `checkin` (optional): Check-in date in YYYY-MM-DD format
-- `checkout` (optional): Check-out date in YYYY-MM-DD format
-- `adults` (optional): Number of adults (default: 1)
-- `children` (optional): Number of children (default: 0)
-- `infants` (optional): Number of infants (default: 0)
-- `pets` (optional): Number of pets (default: 0)
-- `minPrice` (optional): Minimum price per night
-- `maxPrice` (optional): Maximum price per night
-- `cursor` (optional): Pagination cursor for browsing results
-- `propertyType` (optional): Filter by property type — `entire_home`, `private_room`, `shared_room`, or `hotel_room`
-- `ignoreRobotsText` (optional): Override robots.txt for this request
-
-**Returns:**
-- Search results with property details, pricing, and direct links
-- Pagination information for browsing additional results
-- Search URL for reference
-
-### `airbnb_listing_details`
-
-Get detailed information about a specific Airbnb listing.
-
-**Parameters:**
-- `id` (required): Airbnb listing ID
-- `checkin` (optional): Check-in date in YYYY-MM-DD format
-- `checkout` (optional): Check-out date in YYYY-MM-DD format
-- `adults` (optional): Number of adults (default: 1)
-- `children` (optional): Number of children (default: 0)
-- `infants` (optional): Number of infants (default: 0)
-- `pets` (optional): Number of pets (default: 0)
-- `ignoreRobotsText` (optional): Override robots.txt for this request
-
-**Returns:**
-- Detailed property information including:
-  - Location details with coordinates
-  - Amenities and facilities, as `seeAllAmenitiesGroups` — an object keyed by amenity category, so a category can be addressed directly. Amenities Airbnb shows struck through arrive under its own `"Not included"` category:
-
-    ```json
-    {
-      "seeAllAmenitiesGroups": {
-        "Bathroom": "Hair dryer",
-        "Heating and cooling": "AC - split type ductless system, Heating",
-        "Not included": "Dryer, Hot water"
-      }
-    }
-    ```
-  - House rules and policies
-  - Property highlights and descriptions
-  - Direct link to the listing
-
-## Technical Details
-
-### Architecture
-- **Runtime**: Node.js 18+
-- **Protocol**: Model Context Protocol (MCP) via stdio transport
-- **Format**: MCP Bundle (MCPB) v0.3
-- **Dependencies**: Minimal external dependencies for security and reliability
-
-### External Services
-
-In addition to `airbnb.com`, the server makes geocoding requests to two third-party services to translate location queries into accurate map bounding boxes. This bypasses Airbnb's own server-side geocoder, which produces incorrect results for many non-US queries (e.g. "Paris, France" lands in Vendée; "Copenhagen, Denmark" lands in Wisconsin).
-
-| Service | Endpoint | Used for | Notes |
-| --- | --- | --- | --- |
-| [Photon](https://photon.komoot.io/) | `photon.komoot.io` | Primary geocoder, called on every search without `placeId` | Free OSM-based service hosted by Komoot. One request per search. |
-| [Nominatim](https://nominatim.openstreetmap.org/) | `nominatim.openstreetmap.org` | Fallback geocoder, called only when Photon does not return a bounding box | Subject to the [OSMF usage policy](https://operations.osmfoundation.org/policies/nominatim/) (max ~1 req/sec). |
-
-Each search sends only the `location` string from the request to the geocoder — no other request fields, no IP geolocation, no tracking identifiers. The location string itself is, of course, the same string the user typed.
-
-**Opting out:** there are two ways to skip the geocoders:
-
-- **Per-request:** supply an explicit `placeId`. When `placeId` is present, the server uses Airbnb's own place lookup directly with no third-party calls.
-- **Globally:** set the environment variable `DISABLE_GEOCODING=true`. The server will skip Photon/Nominatim entirely and pass the raw location string to Airbnb. This restores the pre-PR behavior for every search and guarantees zero third-party outbound traffic — at the cost of broken results for non-US locations that Airbnb's own geocoder mishandles. Defaults to `false`.
-
-If a geocoder is unreachable or returns no result, the server falls back to sending the location string to Airbnb directly, exactly as it did before — so the worst case for an outage is that international searches degrade to the previous (broken) behavior, not that the search fails entirely.
-
-### Country domains
-
-Airbnb runs a separate domain per country (`airbnb.co.uk`, `airbnb.fr`, …) and hands requests off to the one matching the request origin. When that happens, `www.airbnb.com` does not return the page you asked for — it returns a ~1KB stub that POSTs to `/v2/domain_switch/handoff` via JavaScript:
-
-```html
-<body onload="document.forms[0].submit()">
-<form method="POST" action="https://www.airbnb.co.uk/v2/domain_switch/handoff">
+```sh
+git clone https://github.com/TravisWinsor84/mcp-server-airbnb.git
+cd mcp-server-airbnb
+npm ci
 ```
 
-It arrives as HTTP 200 rather than a 3xx, so no HTTP client follows it, and it contains none of the data the server parses. Requesting the same path on the country domain returns the full page normally.
+`npm ci` builds `dist/index.js`. Configure your MCP client to run `node` with
+the absolute path to that file. For Codex:
 
-The server detects this stub and reports it explicitly, naming the domain Airbnb wants to use:
+```toml
+[mcp_servers.airbnb]
+command = "node"
+args = ["/absolute/path/mcp-server-airbnb/dist/index.js"]
 
-```
-Airbnb handed this request off to its www.airbnb.co.uk country domain instead of
-serving <url>, so there was no page to parse. Set
-AIRBNB_BASE_URL=https://www.airbnb.co.uk to query that domain directly.
-```
-
-Setting [`AIRBNB_BASE_URL`](#airbnb-domain) resolves it for both `airbnb_search` and `airbnb_listing_details`. The default is unchanged, so this only affects setups that hit the handoff.
-
-### Error Handling
-- Comprehensive error logging with timestamps
-- Graceful degradation when Airbnb's page structure changes
-- Country-domain handoffs reported distinctly, rather than as a page-structure change
-- Timeout protection for network requests
-- Detailed error messages for troubleshooting
-
-### Security Measures
-- Robots.txt compliance by default
-- Request timeout limits
-- Input validation and sanitization
-- Secure environment variable handling
-- No sensitive data storage
-
-### Performance
-- Efficient HTML parsing with Cheerio
-- Request caching where appropriate
-- Minimal memory footprint
-- Fast startup and response times
-
-## Compatibility
-
-- **Platforms**: macOS, Windows, Linux
-- **Node.js**: 18.0.0 or higher
-- **Claude Desktop**: 0.10.0 or higher
-- **Other MCP clients**: Compatible with any MCP-supporting application
-
-## Development
-
-### Building from Source
-
-```bash
-# Install dependencies
-npm install
-
-# Build the project
-npm run build
-
-# Watch for changes during development
-npm run watch
+[mcp_servers.airbnb.env]
+AIRBNB_BASE_URL = "https://www.airbnb.com.au"
 ```
 
-### Testing
+Copy `skills/airbnb-holiday-search` into your Codex skills directory.
+Restart/reconnect the MCP after replacing a running build. This GitHub fork is
+not the `@openbnb` npm release; do not install that package expecting these fixes.
+GitHub releases include an npm tarball containing the built server and skill.
 
-```bash
-# Build, then run all three suites
+## Capabilities
+
+- `airbnb_search`: destination, dates, guests, property type, amenities, minimum
+  bedrooms/beds/bathrooms, instant-book/guest-favourite, price bounds, pagination,
+  optional manual bounding box and compact output.
+- `airbnb_listing_details`: requested listing ID, amenities (including unavailable
+  groups), description, highlights, occupancy, house rules, rate-specific
+  cancellation information, host status, review aggregates and photo-room tours
+  when present in Airbnb's page state.
+- Structured price line items and Airbnb's tax note when provided; no invented
+  currency, tax inclusion or final checkout total.
+
+Use the current tool schema for enum values. For example, an entire place with
+air conditioning uses `propertyType: "entire_home"` and
+`amenities: ["air_conditioning"]`, not amenity display labels.
+
+## Configuration and limits
+
+`AIRBNB_BASE_URL` chooses the regional origin. A detected country handoff reports
+the target instead of silently claiming the search returned nothing.
+
+Robots rules are respected by default. A caller explicitly authorized to override
+may use `ignoreRobotsText: true` per request, or configure
+`IGNORE_ROBOTS_TXT=true` / `--ignore-robots-txt`. The actual flag is not
+`--no-robots`. This does not bypass CAPTCHA or guarantee access.
+
+Photon geocoding with Nominatim fallback receives the destination string unless
+you provide a Place ID, a full bounding box, or `DISABLE_GEOCODING=true`.
+Disabling geocoding can reduce location accuracy. Four bbox corners are required.
+
+This is public HTML extraction, not an official Airbnb API. Prices/availability
+can change; missing fields are unknown. The server does not log in, store
+account cookies, message hosts, save listings or book/cancel anything.
+Use [the account-management skill](https://github.com/TravisWinsor84/mcp-airbnb-account)
+through Codex's built-in browser/computer-use tools for those workflows.
+
+## Verification and updates
+
+```sh
 npm test
+npm audit
+npm outdated
+npm pack --dry-run
 ```
 
-`npm test` runs one offline unit suite, then drives the built server over stdio and calls the tools for real:
+Offline tests include real stdio requests against a local HTTP fixture, with
+robots handling, overlapping filter integration, compact badges, and details
+recovery. CI runs on Node 22, 24 and 26. Dependabot tracks dependency updates.
 
-- `test-domain-handoff.js` — country-domain handoff detection against a captured stub, including the cases that must *not* be treated as a handoff. No network required
-- `test-extension.js` — MCP handshake, tool listing, a search, listing details, and the geocoding paths (Photon, Nominatim fallback)
-- `test-amenities.js` — amenity extraction across several live listings, checking that amenities Airbnb strikes through never appear as ones the listing offers
+Opt-in live public checks (no browser automation or account writes):
 
-The latter two hit `airbnb.com` and the geocoders over the network, so they need connectivity and can fail if Airbnb changes its page structure — that's the point of them, but it also means they aren't suitable as an unattended CI gate. They also assume `airbnb.com` serves you a parseable page; from a region where Airbnb hands off to a country domain, set `AIRBNB_BASE_URL` before running them. `test-domain-handoff.js` is offline and deterministic, so it is safe in CI.
-
-The server can also be run directly:
-
-```bash
-# Run with robots.txt compliance (default)
-node dist/index.js
-
-# Run with robots.txt ignored (for testing)
-node dist/index.js --ignore-robots-txt
-
-# Run against a country domain (see Country domains)
-AIRBNB_BASE_URL=https://www.airbnb.co.uk node dist/index.js
+```sh
+AIRBNB_BASE_URL=https://www.airbnb.com.au IGNORE_ROBOTS_TXT=true npm run test:live
 ```
 
-## Legal and Ethical Considerations
-
-- **Respect Airbnb's Terms of Service**: This extension is for legitimate research and booking assistance
-- **Robots.txt Compliance**: The extension respects robots.txt by default
-- **Rate Limiting**: Be mindful of request frequency to avoid overwhelming Airbnb's servers
-- **Data Usage**: Only extract publicly available information for legitimate purposes
-
-## Support
-
-- **Issues**: Report bugs and feature requests on [GitHub Issues](https://github.com/openbnb-org/mcp-server-airbnb/issues)
-- **Documentation**: Additional documentation available in the repository
-- **Community**: Join discussions about MCP and MCPB development
+On 10 September 2026, live search, geocoding, listing details and three amenity
+cases passed. Offline suite: 105 tests plus domain-normalization checks.
+These are snapshots, not a guarantee against future Airbnb markup changes.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
-
-## Contributing
-
-Contributions are welcome! Please read the contributing guidelines and submit pull requests for any improvements.
-
----
-
-**Note**: This extension is not affiliated with Airbnb, Inc. It is an independent tool designed to help users search and analyze publicly available Airbnb listings.
+MIT. Original OpenBnB license and upstream authorship are retained.

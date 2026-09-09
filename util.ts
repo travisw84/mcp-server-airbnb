@@ -1,3 +1,144 @@
+/**
+ * Decode a `demandStayListing.id` — base64 of `"DemandStayListing:<numeric id>"`.
+ *
+ * The decode cannot be trusted on its own. `Buffer.from(x, "base64")` does not throw on
+ * invalid input; it silently skips characters outside the alphabet and decodes whatever
+ * remains. So `"Q29ycnVwdDox-MjM0NQ=="` — malformed, because of the hyphen — still decodes
+ * cleanly to `"Corrupt:12345"`, and a naive `split(":")[1]` hands back the plausible-looking
+ * id `12345` for a listing that does not exist. A try/catch cannot help, because nothing
+ * throws.
+ *
+ * The guard is therefore on the decoded VALUE, not on the encoding: it must be exactly the
+ * entity we expect. Returns undefined otherwise, so the caller omits the id rather than
+ * publishing a fabricated one — and, per partial-output, keeps every other field.
+ */
+export function decodeListingId(encoded: unknown): string | undefined {
+  if (typeof encoded !== "string" || encoded.length === 0) return undefined;
+  let decoded: string;
+  try {
+    decoded = Buffer.from(encoded, "base64").toString("utf8");
+  } catch {
+    return undefined;
+  }
+  const match = /^DemandStayListing:(\d+)$/.exec(decoded);
+  return match ? match[1] : undefined;
+}
+
+/**
+ * Pull the price breakdown out of a search result while it still has structure.
+ *
+ * `explanationData.priceDetails` is an array of line GROUPS, each holding typed
+ * items — `DefaultExplanationLineItem` for the nightly subtotal,
+ * `DiscountedExplanationLineItem` for a reduction, `HighlightExplanationLineItem`
+ * for the post-discount summary. `flattenArraysInObject` joins the whole tree into
+ * one string, which loses the grouping, the types, and the sign of a discount:
+ *
+ *   "3 nights x $890.67: $2,672.00, Special offer: -$52.50, ..."
+ *
+ * It also drops `accessibilityLabel`, which is the only place Airbnb states whether
+ * a total excludes tax ("$2,522.00 total before taxes"). That label appears only on
+ * highlight items, so it is present only when a listing has an active discount —
+ * surfaced opportunistically here rather than promised, because it genuinely is not
+ * available for every listing.
+ *
+ * MUST be called before `cleanObject`, which strips the `__typename` this reads.
+ * Returns null when there is nothing structured to report.
+ */
+export function extractPriceBreakdown(raw: any): any | null {
+  const groups = raw?.structuredDisplayPrice?.explanationData?.priceDetails;
+  if (!Array.isArray(groups) || groups.length === 0) return null;
+
+  const TYPES: Record<string, string> = {
+    DiscountedExplanationLineItem: "discount",
+    HighlightExplanationLineItem: "total",
+  };
+
+  const lineItems: any[] = [];
+  let note: string | undefined;
+
+  for (const group of groups) {
+    const items = Array.isArray(group?.items) ? group.items : [];
+    for (const item of items) {
+      if (!item?.description && !item?.priceString) continue;
+      const type = TYPES[item?.__typename];
+      lineItems.push({
+        description: item.description,
+        price: item.priceString,
+        ...(type ? { type } : {}),
+      });
+      // e.g. "$2,522.00 total before taxes"
+      if (typeof item.accessibilityLabel === "string" && /before taxes/i.test(item.accessibilityLabel)) {
+        note = item.accessibilityLabel;
+      }
+    }
+  }
+
+  if (lineItems.length === 0) return null;
+  return { lineItems, ...(note ? { note } : {}) };
+}
+
+/**
+ * Flatten one Airbnb search result into a shallow object.
+ *
+ * The payload Airbnb ships is shaped for a React tree, not for a reader. A single
+ * result spends most of its bytes on structure rather than information:
+ *
+ *   - `demandStayListing.id` is base64 of "DemandStayListing:<id>", so it restates
+ *     the id we already extract
+ *   - the listing name arrives at
+ *     `demandStayListing.description.name.localizedStringWithTranslationPreference`,
+ *     which costs more in key names than the name itself
+ *   - `explanationData.title` is the constant string "Price details", repeated once
+ *     per result
+ *   - `mapSecondaryLine` and `secondaryLine` are usually empty strings
+ *
+ * None of that survives contact with a consumer, and for an MCP server the consumer
+ * is a context window. Returns only keys that have a value, so absent fields cost
+ * nothing rather than serializing as null.
+ */
+export function compactSearchResult(raw: any, baseUrl: string, priceBreakdown?: any): any {
+  if (!raw || typeof raw !== "object") return raw;
+
+  const listing = raw.demandStayListing ?? {};
+  const id = decodeListingId(listing.id);
+
+  const coordinate = listing.location?.coordinate ?? {};
+  const price = raw.structuredDisplayPrice ?? {};
+
+  // priceDetails arrives with a trailing ", " from the array flattening upstream.
+  const priceDetails =
+    typeof price.explanationData?.priceDetails === "string"
+      ? price.explanationData.priceDetails.replace(/,\s*$/, "")
+      : undefined;
+
+  const out: Record<string, any> = {
+    id,
+    url: id ? `${baseUrl}/rooms/${id}` : undefined,
+    name: listing.description?.name?.localizedStringWithTranslationPreference,
+    layout: raw.structuredContent?.primaryLine,
+    badges: raw.badges,
+    badgeType: raw.badgeType,
+    rating: raw.avgRatingA11yLabel,
+    price: price.primaryLine?.accessibilityLabel,
+    priceDetails,
+    latitude: coordinate.latitude,
+    longitude: coordinate.longitude,
+  };
+
+  for (const key of Object.keys(out)) {
+    const v = out[key];
+    if (v === undefined || v === null || v === "") delete out[key];
+  }
+
+  // The structured breakdown supersedes the flattened priceDetails string when
+  // one is available, so compact mode gains fidelity rather than trading it away.
+  if (priceBreakdown) {
+    delete out.priceDetails;
+    out.priceBreakdown = priceBreakdown;
+  }
+  return out;
+}
+
 export function cleanObject(obj: any) {
   Object.keys(obj).forEach(key => {
     if (obj[key] == null || key === "__typename") {
@@ -48,6 +189,38 @@ export function pickBySchema(obj: any, schema: any): any {
   return result;
 }
 
+/**
+ * Projection for search-result badges through the flatten pipeline.
+ *
+ * Only `text` goes through pickBySchema → flattenArraysInObject so the flattened
+ * badges string stays byte-identical to pre-fix output (e.g. "Guest favorite").
+ * The machine-readable type is attached separately via extractBadgeType — same
+ * pattern as priceBreakdown: structured data rides alongside the flatten result,
+ * never inside it.
+ */
+export const searchBadgeSchema: Record<string, any> = {
+  text: true,
+};
+
+/**
+ * Pull the machine-readable badge type off a raw search result before flatten
+ * collapses the badge object into a string.
+ *
+ * Airbnb assigns one badge per card. Guest favorite often wins the displayed
+ * `text`, while `loggingContext.badgeType` still carries SUPERHOST /
+ * TOP_X_GUEST_FAVORITE / etc. Call before or after cleanObject (badgeType is not
+ * stripped). Returns null when no type is present.
+ */
+export function extractBadgeType(raw: any): string | null {
+  const badges = raw?.badges;
+  if (!Array.isArray(badges)) return null;
+  for (const badge of badges) {
+    const t = badge?.loggingContext?.badgeType;
+    if (typeof t === "string" && t.trim()) return t;
+  }
+  return null;
+}
+
 export function flattenArraysInObject(input: any, inArray: boolean = false): any {
   if (Array.isArray(input)) {
     // Process each item in the array with inArray=true so that any object
@@ -76,26 +249,111 @@ export function flattenArraysInObject(input: any, inArray: boolean = false): any
 }
 
 /**
- * Airbnb moved several PDP sections to client-side rendering. Their entries under
- * `presentation.stayProductDetailPage.sections.sections` still exist, still report
- * sectionContentStatus COMPLETE, but carry a `section` object containing nothing but
- * `__typename`. AMENITIES_DEFAULT and HIGHLIGHTS_DEFAULT are both in that state, so
- * the schema-driven extraction returns an empty shell rather than failing loudly.
+ * Airbnb moved several PDP sections to client-side rendering. Their section-tree
+ * entries still report sectionContentStatus COMPLETE while carrying nothing but
+ * `__typename`, so the real content is recovered from a sibling branch of the
+ * payload: `niobeClientData[i][1].data.node.pdpPresentation`.
  *
- * The content now lives on a sibling branch of the same payload:
- *   niobeClientData[i][1].data.node.pdpPresentation
+ * When `listingId` is provided, entry nodes with a base64 `id` field are checked to
+ * match the requested listing ID. Nodes without an `id` field are accepted as a
+ * fallback only when no ID-bearing entry matched, maintaining backward compatibility.
  *
- * Returns null when the branch is absent, so callers fall back to whatever the
- * section tree gave them rather than losing data if Airbnb moves it again.
+ * Returns null when no matching branch is present.
  */
-export function findPdpPresentation(clientData: any): any | null {
+export function findPdpPresentation(clientData: any, listingId?: string): any | null {
+  const entries = clientData?.niobeClientData;
+  if (!Array.isArray(entries)) return null;
+
+  let idLessFallback: any = null;
+
+  for (const entry of entries) {
+    const node = entry?.[1]?.data?.node;
+    const pdp = node?.pdpPresentation;
+    if (!pdp || typeof pdp !== "object") continue;
+
+    if (!listingId) return pdp;
+
+    const rawId = node?.id;
+    if (typeof rawId === "string" && rawId) {
+      try {
+        const decoded = atob(rawId);
+        const parts = decoded.split("DemandStayListing:");
+        const extractedId = parts.length > 1 ? parts[1] : decoded;
+        if (extractedId === String(listingId)) return pdp;
+      } catch {
+        // Ignore base64 decoding errors for non-standard IDs
+      }
+    } else if (!idLessFallback) {
+      // An ID-less node is saved as fallback, used only if no ID-bearing entry matched.
+      idLessFallback = pdp;
+    }
+  }
+
+  return listingId ? idLessFallback : null;
+}
+
+
+/**
+ * Airbnb also stubs LOCATION_DEFAULT under the same client-side-rendering move that
+ * hits AMENITIES_DEFAULT and HIGHLIGHTS_DEFAULT — sectionContentStatus COMPLETE, but
+ * the section carries no coordinates. Unlike those two, LOCATION_DEFAULT's recovery
+ * source is not `pdpPresentation` — it's a sibling branch of the same node:
+ *
+ *   niobeClientData[i][1].data.node.location
+ *
+ * Mirrors findPdpPresentation exactly (same loop, same "don't hardcode the index"
+ * reasoning), just pointed at a different field of the same node.
+ */
+export function findNodeLocation(clientData: any, listingId?: string): any | null {
   const entries = clientData?.niobeClientData;
   if (!Array.isArray(entries)) return null;
   for (const entry of entries) {
-    const pdp = entry?.[1]?.data?.node?.pdpPresentation;
-    if (pdp && typeof pdp === "object") return pdp;
+    const node = entry?.[1]?.data?.node;
+    if (listingId && node?.id && decodeListingId(node.id) !== listingId) continue;
+    const location = node?.location;
+    if (location && typeof location === "object") return location;
   }
   return null;
+}
+
+/**
+ * Pull {lat, lng} off a `location` node. Both coordinates must be present and
+ * numeric — a lone lat or lng is not a usable location, and emitting a half-formed
+ * pair would let a caller mistake it for a real one. Returns null rather than
+ * fabricating a value when the branch is stubbed, empty, or absent.
+ */
+export function extractLocationCoordinate(location: any): { lat: number; lng: number } | null {
+  const lat = location?.coordinate?.latitude;
+  const lng = location?.coordinate?.longitude;
+  return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : null;
+}
+
+/**
+ * Apply the recovered coordinate to LOCATION_DEFAULT, following the same
+ * replace-the-stub / add-if-absent shape as the fromPdp recovery in
+ * handleAirbnbListingDetails. A section that already carries valid lat/lng passes
+ * through untouched — present-and-valid values always win over recovery. When
+ * `coordinate` is null (recovery found nothing either), the sections are returned
+ * unchanged rather than stripped or fabricated.
+ */
+export function recoverLocationSection(sections: any[], coordinate: { lat: number; lng: number } | null): any[] {
+  if (!coordinate) return sections;
+
+  const hasCoords = (section: any) =>
+    Number.isFinite(section?.lat) && Number.isFinite(section?.lng);
+
+  let found = false;
+  const result = sections.map((section: any) => {
+    if (section?.id !== "LOCATION_DEFAULT") return section;
+    found = true;
+    if (hasCoords(section)) return section;
+    return { id: section.id, ...coordinate };
+  });
+
+  if (!found) {
+    result.push({ id: "LOCATION_DEFAULT", ...coordinate });
+  }
+  return result;
 }
 
 /**
@@ -227,20 +485,262 @@ export function detectDomainHandoff(html: string): string | null {
   }
 }
 
+// Normalize a localized field to its string across all known shapes:
+// plain string | { localizedContent } | { text }
+function localizedStr(v: any): string | undefined {
+  const s = typeof v === "string" ? v : v?.localizedContent ?? v?.text;
+  // Anything non-string would stringify to "[object Object]" downstream; an empty
+  // string must read as missing so the legacy key below still gets its turn.
+  return typeof s === "string" && s !== "" ? s : undefined;
+}
+
+/**
+ * `mediaTour`, `sleepingArrangements`, and `bathroomsTour` are three sibling keys
+ * under `pdpPresentation` that all share the same `MediaTour` shape - a photo tour
+ * with one stop per room/space:
+ *
+ *   MediaTour     = { name, stops: [MediaTourStop] }
+ *   MediaTourStop = { name, items: [{ image: { caption, imageId, uri, ... } }], description }
+ *
+ * The primary use case is a capacity check: a listing can claim N bedrooms while
+ * one "bedroom" stop is really a den, distinguishable only by which amenities its
+ * description lists relative to its peers (e.g. missing "Clothing storage" /
+ * "Hangers" / "Essentials" / "Room-darkening shades"). So the per-room amenity list
+ * is the primary payload here, not the images.
+ *
+ * Raw image data (uri, imageId, assetMetadata, tags) is deliberately never
+ * emitted - a photo tour holds dozens of images, and dumping their internals would
+ * undo this fork's whole reason for existing (staying far below stock token cost).
+ * Only stop name, deduped non-empty host captions, and the per-room amenity texts
+ * are surfaced.
+ *
+ * Partial-output tolerant throughout: any of `stops`, `items`, `caption`, or
+ * `description` may be missing, null, or malformed. A malformed individual stop or
+ * item is skipped rather than aborting the whole tour. Returns null - never throws,
+ * never emits an empty shell - when there is nothing worth reporting.
+ */
+export function extractMediaTour(tour: any): any | null {
+  if (!tour || typeof tour !== "object") return null;
+  const rawStops = Array.isArray(tour.stops) ? tour.stops : [];
+
+  const stops = rawStops
+    .map((stop: any) => {
+      if (!stop || typeof stop !== "object") return null;
+
+      const out: Record<string, any> = {};
+      if (typeof stop.name === "string" && stop.name.trim()) out.name = stop.name;
+
+      const items = Array.isArray(stop.items) ? stop.items : [];
+      const seen = new Set<string>();
+      const captions: string[] = [];
+      for (const item of items) {
+        const user = item?.image?.caption?.user;
+        const text = user?.localizedStringWithTranslationPreference ?? user?.localizedString;
+        if (typeof text !== "string") continue;
+        const trimmed = text.trim();
+        if (!trimmed || seen.has(trimmed)) continue;
+        seen.add(trimmed);
+        captions.push(trimmed);
+      }
+      if (captions.length) out.captions = captions;
+
+      const descriptions = stop.description?.descriptions;
+      if (Array.isArray(descriptions)) {
+        const amenities = descriptions
+          .map((d: any) => d?.text)
+          .filter((t: any) => typeof t === "string" && t.trim());
+        if (amenities.length) out.amenities = amenities;
+      }
+
+      return Object.keys(out).length ? out : null;
+    })
+    .filter((s: any): s is Record<string, any> => s !== null);
+
+  if (stops.length === 0) return null;
+
+  const out: Record<string, any> = { stops };
+  if (typeof tour.name === "string" && tour.name.trim()) out.sectionTitle = tour.name;
+  // Put sectionTitle first for readability - rebuild in the preferred key order.
+  return "sectionTitle" in out ? { sectionTitle: out.sectionTitle, stops: out.stops } : out;
+}
+
 export function extractHighlights(pdp: any): any | null {
   const highlights = pdp?.highlights;
   if (!Array.isArray(highlights) || highlights.length === 0) return null;
   const mapped = highlights
     .map((h: any) => {
-      const title = h?.title;
+      // Live payloads now use headline/body; older ones used title/subtitle. Accept both.
+      const title = localizedStr(h?.headline) ?? localizedStr(h?.title);
       // Interpolating first would turn a missing title into the literal string
       // "null: Free parking on premises", which .filter(Boolean) cannot catch.
       if (!title) return null;
-      // Airbnb has shipped this as both a plain string and a { text } object.
-      const sub = typeof h?.subtitle === "string" ? h.subtitle : h?.subtitle?.text;
+      const sub = localizedStr(h?.body) ?? localizedStr(h?.subtitle);
       return sub ? `${title}: ${sub}` : title;
     })
     .filter(Boolean);
 
   return mapped.length ? { highlights: mapped } : null;
+}
+
+/** Finite personCapacity on pdpPresentation; null when missing/non-numeric. */
+export function extractOccupancy(pdp: any): any | null {
+  const capacity = pdp?.personCapacity;
+  if (typeof capacity !== "number" || !Number.isFinite(capacity)) return null;
+  return { personCapacity: capacity };
+}
+
+/**
+ * bookingPrefetchData lives on section-tree metadata, not pdpPresentation.
+ * Walks niobeClientData like findPdpPresentation — index 0 is not guaranteed.
+ */
+export function findBookingPrefetchData(clientData: any): any | null {
+  const entries = clientData?.niobeClientData;
+  if (!Array.isArray(entries)) return null;
+  for (const entry of entries) {
+    const prefetch =
+      entry?.[1]?.data?.presentation?.stayProductDetailPage?.sections?.metadata
+        ?.bookingPrefetchData;
+    if (prefetch && typeof prefetch === "object") return prefetch;
+  }
+  return null;
+}
+
+export function extractCancellationPolicies(prefetch: any): any | null {
+  const policies = prefetch?.cancellationPolicies;
+  if (!Array.isArray(policies) || policies.length === 0) return null;
+
+  const mapped = policies
+    .map((p: any) => {
+      // Airbnb has shipped both snake_case (legacy) and camelCase keys.
+      const name =
+        p?.localized_cancellation_policy_name ??
+        p?.localizedCancellationPolicyName ??
+        null;
+      if (!name) return null;
+
+      const description =
+        typeof p?.book_it_module_tooltip === "string"
+          ? p.book_it_module_tooltip
+          : typeof p?.bookItModuleTooltip === "string"
+            ? p.bookItModuleTooltip
+            : null;
+
+      const priceType =
+        p?.cancellation_policy_price_type ??
+        p?.cancellationPolicyPriceType ??
+        null;
+
+      // Price field names vary and are often absent from the initial SSR payload.
+      const price =
+        p?.price ??
+        p?.displayPrice?.amount ??
+        p?.structuredDisplayPrice?.primaryLine?.price ??
+        p?.optionalityPriceDetail?.price ??
+        null;
+
+      return {
+        name,
+        ...(description ? { description } : {}),
+        ...(priceType ? { priceType } : {}),
+        ...(price != null && price !== "" ? { price } : {}),
+      };
+    })
+    .filter(Boolean);
+
+  return mapped.length ? { cancellationPolicies: mapped } : null;
+}
+
+/** POLICIES_DEFAULT house rules: full sections first, then short preview list. */
+export function extractHouseRules(policiesSection: any): any | null {
+  if (!policiesSection || typeof policiesSection !== "object") return null;
+
+  const label = (item: any) => {
+    const title = item?.title;
+    if (!title) return null;
+    const sub =
+      typeof item?.subtitle === "string"
+        ? item.subtitle
+        : item?.subtitle?.text;
+    return sub ? `${title}: ${sub}` : title;
+  };
+
+  const sections = policiesSection.houseRulesSections;
+  if (Array.isArray(sections) && sections.length > 0) {
+    const mapped = sections
+      .map((sec: any) => {
+        const items = Array.isArray(sec?.items) ? sec.items : [];
+        const labeled = items.map(label).filter(Boolean);
+        return labeled.length ? { title: sec?.title, items: labeled } : null;
+      })
+      .filter(Boolean);
+
+    if (mapped.length) {
+      return {
+        ...(policiesSection.title ? { title: policiesSection.title } : {}),
+        ...(policiesSection.houseRulesTitle
+          ? { houseRulesTitle: policiesSection.houseRulesTitle }
+          : {}),
+        houseRulesSections: mapped,
+      };
+    }
+  }
+
+  const preview = policiesSection.houseRules;
+  if (Array.isArray(preview) && preview.length > 0) {
+    const items = preview.map(label).filter(Boolean);
+    if (items.length) {
+      return {
+        ...(policiesSection.houseRulesTitle
+          ? { title: policiesSection.houseRulesTitle }
+          : {}),
+        houseRules: items,
+      };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Host Superhost status (and optional passport stats) from
+ * pdpPresentation.hostInfo.passportData.
+ * MEET_YOUR_HOST sections arrive as stubs; the live boolean lives here.
+ * Returns null when the branch is absent or isSuperhost is not a boolean.
+ *
+ * `stats` (Reviews / Rating / …) is projected when Airbnb includes it on the
+ * hostInfo branch — as `passportData.stats` or `hostInfo.stats`. Each entry is
+ * `{ label, value }`; malformed items are skipped rather than poisoning the rest.
+ */
+export function extractHostInfo(pdp: any): any | null {
+  const hostInfo = pdp?.hostInfo;
+  const passport = hostInfo?.passportData;
+  if (!passport || typeof passport !== "object") return null;
+  if (typeof passport.isSuperhost !== "boolean") return null;
+
+  const out: Record<string, any> = { isSuperhost: passport.isSuperhost };
+  if (typeof passport.name === "string" && passport.name.trim()) out.name = passport.name;
+  if (typeof passport.titleText === "string" && passport.titleText.trim()) {
+    out.titleText = passport.titleText;
+  }
+
+  const rawStats = Array.isArray(passport.stats)
+    ? passport.stats
+    : Array.isArray(hostInfo?.stats)
+      ? hostInfo.stats
+      : null;
+  if (rawStats) {
+    const stats = rawStats
+      .map((s: any) => {
+        if (!s || typeof s !== "object") return null;
+        const label = typeof s.label === "string" ? s.label : null;
+        const value =
+          typeof s.value === "string" || typeof s.value === "number" ? s.value : null;
+        if (label == null || value == null) return null;
+        return { label, value: String(value) };
+      })
+      .filter(Boolean);
+    if (stats.length) out.stats = stats;
+  }
+
+  return out;
 }

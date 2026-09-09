@@ -1,0 +1,10 @@
+interface:
+  display_name: "Airbnb Holiday Search"
+  short_description: "Search and compare Airbnb holiday stays"
+  default_prompt: "Use $airbnb-holiday-search to compare stays for my holiday."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "airbnb"
+      description: "Read-only Airbnb search and listing details"
+      transport: "stdio"

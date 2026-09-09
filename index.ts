@@ -11,7 +11,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import fetch from "node-fetch";
 import * as cheerio from "cheerio";
-import { cleanObject, flattenArraysInObject, pickBySchema, diagnoseJsonPath, findPdpPresentation, extractAmenities, extractHighlights, keyAmenityGroups, detectDomainHandoff, normalizeBaseUrl, DEFAULT_BASE_URL } from "./util.js";
+import { cleanObject, flattenArraysInObject, pickBySchema, diagnoseJsonPath, findPdpPresentation, extractAmenities, extractHighlights, keyAmenityGroups, detectDomainHandoff, normalizeBaseUrl, DEFAULT_BASE_URL, findNodeLocation, extractLocationCoordinate, recoverLocationSection, extractOccupancy, findBookingPrefetchData, extractCancellationPolicies, extractHouseRules, extractHostInfo, extractBadgeType, searchBadgeSchema, extractMediaTour, compactSearchResult, decodeListingId, extractPriceBreakdown } from "./util.js";
+import { extractDescription, extractPdpRules, validateInputs, retryDelay } from "./reliability.js";
 import robotsParser from "robots-parser";
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -88,9 +89,68 @@ const AIRBNB_SEARCH_TOOL: Tool = {
         enum: ["entire_home", "private_room", "shared_room", "hotel_room"],
         description: "Filter by property type: 'entire_home' (entire homes/apartments), 'private_room' (private rooms in shared homes), 'shared_room' (shared/dorm-style rooms), 'hotel_room' (hotel rooms)"
       },
+      amenities: {
+        type: "array",
+        items: {
+          type: "string",
+          enum: [
+            "air_conditioning", "heating",
+            "wifi", "tv",
+            "washer", "dryer",
+            "workspace", "dining_table",
+            "kitchen", "microwave", "coffee_maker", "refrigerator", "dishwasher", "oven", "stove",
+            "bathtub", "hair_dryer", "iron", "hangers", "essentials",
+            "pool", "hot_tub", "exercise_equipment",
+            "free_parking",
+            "smoke_alarm", "carbon_monoxide_alarm",
+            "crib", "high_chair", "king_bed", "self_checkin"
+          ]
+        },
+        description: "Required amenities. Each value maps to an Airbnb amenity ID and is sent as &amenities[]=<id> on the search URL, so Airbnb filters at the source. Listings missing any of these are excluded from the response."
+      },
+      instantBook: {
+        type: "boolean",
+        description: "Filter to listings with Instant Book enabled (no host approval needed)."
+      },
+      guestFavorite: {
+        type: "boolean",
+        description: "Filter to Airbnb's curated 'Guest favorite' quality bucket."
+      },
+      minBedrooms: {
+        type: "number",
+        description: "Minimum number of bedrooms."
+      },
+      minBeds: {
+        type: "number",
+        description: "Minimum number of beds (any type — to filter by type use amenities, e.g. ['king_bed'])."
+      },
+      minBathrooms: {
+        type: "number",
+        description: "Minimum number of bathrooms."
+      },
+      ne_lat: {
+        type: "number",
+        description: "Manual bounding-box override: northeast latitude. Provide all four bbox values together (ne_lat, ne_lng, sw_lat, sw_lng) to skip the third-party geocoder for this request."
+      },
+      ne_lng: {
+        type: "number",
+        description: "Manual bounding-box override: northeast longitude. See ne_lat."
+      },
+      sw_lat: {
+        type: "number",
+        description: "Manual bounding-box override: southwest latitude. See ne_lat."
+      },
+      sw_lng: {
+        type: "number",
+        description: "Manual bounding-box override: southwest longitude. See ne_lat."
+      },
       ignoreRobotsText: {
         type: "boolean",
         description: "Ignore robots.txt rules for this request"
+      },
+      compact: {
+        type: "boolean",
+        description: "Return a flattened result shape and unindented JSON. Same information, roughly 60% fewer tokens. Recommended when results are read by a model rather than parsed by code."
       }
     },
     required: ["location"]
@@ -306,12 +366,18 @@ async function geocodeLocation(location: string): Promise<{
   return coords;
 }
 
-const PROPERTY_TYPE_IDS: Record<string, string> = {
-  entire_home:  "1",
-  private_room: "2",
-  shared_room:  "3",
-  hotel_room:   "4",
+// Airbnb's room type filter on the public search URL. The previous mapping
+// used `l2_property_type_ids[]=N`, which is the subtype filter (Apartment,
+// House, Villa, etc.) and does NOT exclude shared/private rooms, so listings
+// like "Room in a home" leaked through when `entire_home` was requested. The
+// correct filter is `room_types[]=<label>` with the URL-encoded room type.
+const ROOM_TYPE_LABELS: Record<string, string> = {
+  entire_home:  "Entire home/apt",
+  private_room: "Private room",
+  shared_room:  "Shared room",
+  hotel_room:   "Hotel room",
 };
+
 
 // Configuration from environment variables (set by DXT host)
 const IGNORE_ROBOTS_TXT = process.env.IGNORE_ROBOTS_TXT === "true" || process.argv.slice(2).includes("--ignore-robots-txt");
@@ -368,7 +434,7 @@ function isPathAllowed(path: string): boolean {
 
   try {
     const robots = robotsParser(`${BASE_URL}/robots.txt`, robotsTxtContent);
-    const allowed = robots.isAllowed(path, USER_AGENT);
+    const allowed = robots.isAllowed(new URL(path, BASE_URL).href, USER_AGENT) ?? false;
     
     if (!allowed) {
       log('warn', 'Path disallowed by robots.txt', { path, userAgent: USER_AGENT });
@@ -384,7 +450,7 @@ function isPathAllowed(path: string): boolean {
   }
 }
 
-async function fetchWithUserAgent(url: string, timeout: number = 30000) {
+async function fetchWithUserAgent(url: string, timeout: number = 30000, attempt = 0): Promise<import("node-fetch").Response> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
   
@@ -401,10 +467,15 @@ async function fetchWithUserAgent(url: string, timeout: number = 30000) {
     
     clearTimeout(timeoutId);
     
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    if (response.status === 429) {
+      const delay = retryDelay(attempt, response.headers.get("retry-after"));
+      if (delay !== null) {
+        await response.text();
+        await new Promise(resolve => setTimeout(resolve, delay));
+        return fetchWithUserAgent(url, timeout, attempt + 1);
+      }
     }
-    
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     return response;
   } catch (error) {
     clearTimeout(timeoutId);
@@ -438,6 +509,53 @@ function assertNotDomainHandoff(html: string, url: string) {
 }
 
 // API handlers
+// Airbnb amenity IDs. These map friendly names to the integers Airbnb's search
+// URL accepts as `amenities[]=N`. To extend: open airbnb.com/s/anywhere/homes,
+// tick the desired amenity in the filters panel, and copy the new ID from the
+// URL. Only IDs verified against public sources or live URLs are listed here.
+const AMENITY_IDS: Record<string, number> = {
+  king_bed: 1000,
+  self_checkin: 51,
+  // Climate
+  air_conditioning: 5,
+  heating: 30,
+  // Connectivity & entertainment
+  wifi: 4,
+  tv: 1,
+  // Laundry
+  washer: 33,
+  dryer: 34,
+  // Work & dining
+  workspace: 47,
+  dining_table: 236,
+  // Kitchen
+  kitchen: 8,
+  microwave: 89,
+  coffee_maker: 90,
+  refrigerator: 91,
+  dishwasher: 92,
+  oven: 95,
+  stove: 96,
+  // Bath & essentials
+  bathtub: 61,
+  hair_dryer: 45,
+  iron: 46,
+  hangers: 44,
+  essentials: 40,
+  // Outdoor & wellness
+  pool: 7,
+  hot_tub: 25,
+  exercise_equipment: 227,
+  // Parking
+  free_parking: 9,
+  // Safety
+  smoke_alarm: 35,
+  carbon_monoxide_alarm: 36,
+  // Family
+  crib: 71,
+  high_chair: 64,
+};
+
 async function handleAirbnbSearch(params: any) {
   const {
     location,
@@ -452,7 +570,18 @@ async function handleAirbnbSearch(params: any) {
     maxPrice,
     cursor,
     propertyType,
+    amenities,
+    instantBook,
+    guestFavorite,
+    minBedrooms,
+    minBeds,
+    minBathrooms,
+    ne_lat,
+    ne_lng,
+    sw_lat,
+    sw_lng,
     ignoreRobotsText = false,
+    compact = false,
   } = params;
 
   // Build search URL
@@ -466,11 +595,21 @@ async function handleAirbnbSearch(params: any) {
   
   // Add placeId
   if (placeId) searchUrl.searchParams.append("place_id", placeId);
-  
+
+  // Manual bounding-box override: agent supplied all four corners directly.
+  const manualBbox =
+    ne_lat != null && ne_lng != null && sw_lat != null && sw_lng != null;
+  if (manualBbox) {
+    searchUrl.searchParams.append("ne_lat", String(ne_lat));
+    searchUrl.searchParams.append("ne_lng", String(ne_lng));
+    searchUrl.searchParams.append("sw_lat", String(sw_lat));
+    searchUrl.searchParams.append("sw_lng", String(sw_lng));
+  }
+
   // Geocode and add bounding box to fix broken server-side geocoding.
-  // Skipped when placeId is supplied (Airbnb's place lookup is reliable for those)
-  // or when DISABLE_GEOCODING=true (user opt-out from third-party calls).
-  if (!placeId && !DISABLE_GEOCODING) {
+  // Skipped when placeId is supplied (Airbnb's place lookup is reliable for those),
+  // when a manual bbox was supplied, or when DISABLE_GEOCODING=true.
+  if (!placeId && !manualBbox && !DISABLE_GEOCODING) {
     const coords = await geocodeLocation(location);
     if (coords) {
       searchUrl.searchParams.append("ne_lat", coords.ne_lat);
@@ -502,10 +641,29 @@ async function handleAirbnbSearch(params: any) {
   if (minPrice != null) searchUrl.searchParams.append("price_min", minPrice.toString());
   if (maxPrice != null) searchUrl.searchParams.append("price_max", maxPrice.toString());
   
-  // Add property type filter
-  if (propertyType && PROPERTY_TYPE_IDS[propertyType]) {
-    searchUrl.searchParams.append("l2_property_type_ids[]", PROPERTY_TYPE_IDS[propertyType]);
+  // Add room type filter (Entire / Private / Shared / Hotel room)
+  if (propertyType && ROOM_TYPE_LABELS[propertyType]) {
+    searchUrl.searchParams.append("room_types[]", ROOM_TYPE_LABELS[propertyType]);
   }
+
+  // Add amenity filters. Airbnb's search expects `amenities[]=<id>` per amenity.
+  if (Array.isArray(amenities)) {
+    for (const a of amenities) {
+      const id = AMENITY_IDS[a];
+      if (id !== undefined) {
+        searchUrl.searchParams.append("amenities[]", id.toString());
+      }
+    }
+  }
+
+  // Quality / booking filters
+  if (instantBook) searchUrl.searchParams.append("ib", "true");
+  if (guestFavorite) searchUrl.searchParams.append("guest_favorite", "true");
+
+  // Minimum room/bed counts
+  if (minBedrooms != null) searchUrl.searchParams.append("min_bedrooms", String(minBedrooms));
+  if (minBeds != null) searchUrl.searchParams.append("min_beds", String(minBeds));
+  if (minBathrooms != null) searchUrl.searchParams.append("min_bathrooms", String(minBathrooms));
 
   // Add cursor for pagination
   if (cursor) {
@@ -535,9 +693,7 @@ async function handleAirbnbSearch(params: any) {
       description: true,
       location: true,
     },
-    badges: {
-      text: true,
-    },
+    badges: searchBadgeSchema,
     structuredContent: {
       mapCategoryInfo: {
         body: true
@@ -599,15 +755,39 @@ async function handleAirbnbSearch(params: any) {
       }
       
       const clientData = JSON.parse(scriptContent);
-      const results = clientData.niobeClientData[0][1].data.presentation.staysSearch.results;
+      const results = clientData.niobeClientData?.map((entry: any) => entry?.[1]?.data?.presentation?.staysSearch?.results).find((value: any) => Array.isArray(value?.searchResults));
+      if (!results) throw new Error("Search results branch missing");
+
+      // Must run before cleanObject, which strips the __typename that distinguishes
+      // a discount line from a subtotal.
+      const breakdowns: any[] = results.searchResults.map((raw: any) => extractPriceBreakdown(raw));
+
       cleanObject(results);
-      
+
       staysSearchResults = {
         searchResults: results.searchResults
-          .map((result: any) => flattenArraysInObject(pickBySchema(result, allowSearchResultSchema)))
           .map((result: any) => {
-            const id = atob(result.demandStayListing.id).split(":")[1];
-            return {id, url: `${BASE_URL}/rooms/${id}`, ...result }
+            // badgeType must be read before flatten collapses badges to a string.
+            // Same attach-after-flatten pattern as priceBreakdown: structured data
+            // rides alongside the card, never inside the flattened badges string.
+            const badgeType = extractBadgeType(result);
+            const flat = flattenArraysInObject(pickBySchema(result, allowSearchResultSchema));
+            if (badgeType) flat.badgeType = badgeType;
+            return flat;
+          })
+          .map((result: any, i: number) => {
+            const breakdown = breakdowns[i];
+            if (compact) return compactSearchResult(result, BASE_URL, breakdown);
+            // atob throws on malformed base64, which would abort the whole map and
+            // lose every result over one bad listing. Validate instead and let a
+            // single unusable id cost only its own id field.
+            const id = decodeListingId(result.demandStayListing?.id);
+            // Omit rather than emit ".../rooms/undefined", which reads as a real link.
+            const out: any = id
+              ? { id, url: `${BASE_URL}/rooms/${id}`, ...result }
+              : { ...result };
+            if (breakdown) out.priceBreakdown = breakdown;
+            return out;
           }),
         paginationInfo: results.paginationInfo
       }
@@ -641,13 +821,12 @@ async function handleAirbnbSearch(params: any) {
       };
     }
 
+    const payload = { searchUrl: searchUrl.toString(), ...staysSearchResults };
     return {
       content: [{
         type: "text",
-        text: JSON.stringify({
-          searchUrl: searchUrl.toString(),
-          ...staysSearchResults
-        }, null, 2)
+        // Indentation is ~25% of this response and buys a reader nothing.
+        text: compact ? JSON.stringify(payload) : JSON.stringify(payload, null, 2)
       }],
       isError: false
     };
@@ -730,10 +909,17 @@ async function handleAirbnbListingDetails(params: any) {
     },
     "POLICIES_DEFAULT": {
       title: true,
+      cancellationPolicyTitle: true,
+      cancellationPolicyForDisplay: true,
+      houseRulesTitle: true,
+      houseRules: {
+        title: true
+      },
       houseRulesSections: {
         title: true,
-        items : {
-          title: true
+        items: {
+          title: true,
+          subtitle: true
         }
       }
     },
@@ -754,6 +940,22 @@ async function handleAirbnbListingDetails(params: any) {
         amenities: {
           title: true
         }
+      }
+    },
+    "REVIEWS_DEFAULT": {
+      overallRating: true,
+      overallCount: true,
+      isGuestFavorite: true,
+      ratings: {
+        categoryType: true,
+        localizedRating: true,
+        label: true,
+        percentage: true
+      },
+      ratingDistribution: {
+        label: true,
+        percentage: true,
+        starCount: true
       }
     },
     //"AVAILABLITY_CALENDAR_DEFAULT": true,
@@ -783,7 +985,7 @@ async function handleAirbnbListingDetails(params: any) {
       }
       
       const clientData = JSON.parse(scriptContent);
-      const sections = clientData.niobeClientData[0][1].data.presentation.stayProductDetailPage.sections.sections;
+      const sections = clientData.niobeClientData?.map((entry: any) => entry?.[1]?.data?.presentation?.stayProductDetailPage?.sections?.sections).find(Array.isArray) ?? [];
       sections.forEach((section: any) => cleanObject(section));
       
       let extracted: any[] = sections
@@ -801,12 +1003,14 @@ async function handleAirbnbListingDetails(params: any) {
       // absent. Counting keys would be fragile in the direction that loses data: if
       // Airbnb ever adds one placeholder key to a stub, a count-based test would decide
       // the section was populated and silently discard the recovered content.
-      const pdp = findPdpPresentation(clientData);
+      const pdp = findPdpPresentation(clientData, id);
       const recovered: string[] = [];
       if (pdp) {
         const fromPdp: Record<string, { value: any | null; contentKey: string }> = {
           AMENITIES_DEFAULT: { value: extractAmenities(pdp), contentKey: "seeAllAmenitiesGroups" },
           HIGHLIGHTS_DEFAULT: { value: extractHighlights(pdp), contentKey: "highlights" },
+          DESCRIPTION_DEFAULT: { value: extractDescription(pdp), contentKey: "htmlDescription" },
+          POLICIES_DEFAULT: { value: extractPdpRules(pdp), contentKey: "houseRulesSections" },
         };
 
         extracted = extracted.map((section: any) => {
@@ -828,6 +1032,75 @@ async function handleAirbnbListingDetails(params: any) {
             extracted.push({ id: sectionId, ...flattenArraysInObject(keyAmenityGroups(replacement.value)) });
           }
         }
+
+        // Occupancy lives on pdpPresentation, not on any allowlisted section.
+        const occupancy = extractOccupancy(pdp);
+        if (occupancy && !extracted.some((s: any) => s.id === "OCCUPANCY")) {
+          recovered.push("OCCUPANCY");
+          extracted.push({ id: "OCCUPANCY", ...occupancy });
+        }
+      }
+
+      // House rules: POLICIES_DEFAULT is still usually populated, but when it is a
+      // bare stub (or dropped), recover a labeled form via extractHouseRules.
+      const policiesSection = sections.find((s: any) => s.sectionId === "POLICIES_DEFAULT")?.section;
+      const houseRules = extractHouseRules(policiesSection);
+      if (houseRules) {
+        const existing = extracted.find((s: any) => s.id === "POLICIES_DEFAULT");
+        if (!existing) {
+          recovered.push("POLICIES_DEFAULT");
+          extracted.push({ id: "POLICIES_DEFAULT", ...flattenArraysInObject(houseRules) });
+        } else if (!existing.houseRulesSections && !existing.houseRules) {
+          recovered.push("POLICIES_DEFAULT");
+          Object.assign(existing, flattenArraysInObject(houseRules));
+        }
+      }
+
+      // Cancellation options live on metadata.bookingPrefetchData, not the
+      // section tree. Surface them as their own details entry when present.
+      const cancellation = extractCancellationPolicies(findBookingPrefetchData(clientData));
+      if (cancellation && !extracted.some((s: any) => s.id === "CANCELLATION_POLICY")) {
+        recovered.push("CANCELLATION_POLICY");
+        extracted.push({ id: "CANCELLATION_POLICY", ...flattenArraysInObject(cancellation) });
+      }
+
+      // LOCATION_DEFAULT gets the same fromPdp-style recovery, but its source is a
+      // sibling branch of the node (node.location) rather than node.pdpPresentation,
+      // so Airbnb can stub it independently of the amenities/highlights move. Without
+      // this, a stubbed section silently reports success with no coordinates - the
+      // exact failure mode that killed mcp.openbnb.ai.
+      const locationCoordinate = extractLocationCoordinate(findNodeLocation(clientData, id));
+      if (locationCoordinate) {
+        const before = extracted.find((s: any) => s.id === "LOCATION_DEFAULT");
+        const alreadyHadCoords = before && Number.isFinite(before.lat) && Number.isFinite(before.lng);
+        extracted = recoverLocationSection(extracted, locationCoordinate);
+        if (!alreadyHadCoords) recovered.push("LOCATION_DEFAULT");
+      }
+      if (pdp) {
+
+        // HOST is additive (MEET_YOUR_HOST is a stub). Superhost lives on passportData.
+        const host = extractHostInfo(pdp);
+        if (host && !extracted.some((s: any) => s.id === "HOST")) {
+          recovered.push("HOST");
+          extracted.push({ id: "HOST", ...host });
+        }
+      }
+
+      // Photo tour: mediaTour, sleepingArrangements, and bathroomsTour are three
+      // sibling keys under pdpPresentation sharing one MediaTour shape. Unlike
+      // AMENITIES_DEFAULT/HIGHLIGHTS_DEFAULT above, none of these
+      // ever appear as a stubbed entry in the sections list - they are additive,
+      // not a stub to replace. The per-room amenity list is the primary payload
+      // (see extractMediaTour's docstring): it is what lets a caller catch a
+      // listing that claims N bedrooms while one "bedroom" stop is really a den.
+      const photoTourSections: Array<[string, any]> = [
+        ["PHOTO_TOUR", pdp?.mediaTour],
+        ["SLEEPING_ARRANGEMENTS_TOUR", pdp?.sleepingArrangements],
+        ["BATHROOMS_TOUR", pdp?.bathroomsTour],
+      ];
+      for (const [id, tour] of photoTourSections) {
+        const value = extractMediaTour(tour);
+        if (value) extracted.push({ id, ...value });
       }
 
       details = extracted;
@@ -931,7 +1204,7 @@ log('info', 'Airbnb MCP Server starting', {
 
 // Set up request handlers
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: AIRBNB_TOOLS,
+  tools: AIRBNB_TOOLS.map(tool => ({...tool, annotations: {readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true}})),
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -952,6 +1225,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       arguments: request.params.arguments 
     });
     
+    const definition = AIRBNB_TOOLS.find(tool => tool.name === request.params.name);
+    if (!definition) throw new Error("Unknown tool");
+    validateInputs(request.params.arguments, definition.inputSchema);
+
     // Ensure robots.txt is loaded
     if (!robotsTxtContent && !IGNORE_ROBOTS_TXT) {
       await fetchRobotsTxt();
