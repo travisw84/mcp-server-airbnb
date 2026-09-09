@@ -117,6 +117,7 @@ export function compactSearchResult(raw: any, baseUrl: string, priceBreakdown?: 
     name: listing.description?.name?.localizedStringWithTranslationPreference,
     layout: raw.structuredContent?.primaryLine,
     badges: raw.badges,
+    badgeType: raw.badgeType,
     rating: raw.avgRatingA11yLabel,
     price: price.primaryLine?.accessibilityLabel,
     priceDetails,
@@ -303,11 +304,13 @@ export function findPdpPresentation(clientData: any, listingId?: string): any | 
  * Mirrors findPdpPresentation exactly (same loop, same "don't hardcode the index"
  * reasoning), just pointed at a different field of the same node.
  */
-export function findNodeLocation(clientData: any): any | null {
+export function findNodeLocation(clientData: any, listingId?: string): any | null {
   const entries = clientData?.niobeClientData;
   if (!Array.isArray(entries)) return null;
   for (const entry of entries) {
-    const location = entry?.[1]?.data?.node?.location;
+    const node = entry?.[1]?.data?.node;
+    if (listingId && node?.id && decodeListingId(node.id) !== listingId) continue;
+    const location = node?.location;
     if (location && typeof location === "object") return location;
   }
   return null;

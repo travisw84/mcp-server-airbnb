@@ -12,6 +12,7 @@ import {
 import fetch from "node-fetch";
 import * as cheerio from "cheerio";
 import { cleanObject, flattenArraysInObject, pickBySchema, diagnoseJsonPath, findPdpPresentation, extractAmenities, extractHighlights, keyAmenityGroups, detectDomainHandoff, normalizeBaseUrl, DEFAULT_BASE_URL, findNodeLocation, extractLocationCoordinate, recoverLocationSection, extractOccupancy, findBookingPrefetchData, extractCancellationPolicies, extractHouseRules, extractHostInfo, extractBadgeType, searchBadgeSchema, extractMediaTour, compactSearchResult, decodeListingId, extractPriceBreakdown } from "./util.js";
+import { extractDescription, extractPdpRules, validateInputs, retryDelay } from "./reliability.js";
 import robotsParser from "robots-parser";
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -433,7 +434,7 @@ function isPathAllowed(path: string): boolean {
 
   try {
     const robots = robotsParser(`${BASE_URL}/robots.txt`, robotsTxtContent);
-    const allowed = robots.isAllowed(path, USER_AGENT);
+    const allowed = robots.isAllowed(new URL(path, BASE_URL).href, USER_AGENT) ?? false;
     
     if (!allowed) {
       log('warn', 'Path disallowed by robots.txt', { path, userAgent: USER_AGENT });
@@ -449,7 +450,7 @@ function isPathAllowed(path: string): boolean {
   }
 }
 
-async function fetchWithUserAgent(url: string, timeout: number = 30000) {
+async function fetchWithUserAgent(url: string, timeout: number = 30000, attempt = 0): Promise<import("node-fetch").Response> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
   
@@ -466,10 +467,15 @@ async function fetchWithUserAgent(url: string, timeout: number = 30000) {
     
     clearTimeout(timeoutId);
     
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    if (response.status === 429) {
+      const delay = retryDelay(attempt, response.headers.get("retry-after"));
+      if (delay !== null) {
+        await response.text();
+        await new Promise(resolve => setTimeout(resolve, delay));
+        return fetchWithUserAgent(url, timeout, attempt + 1);
+      }
     }
-    
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     return response;
   } catch (error) {
     clearTimeout(timeoutId);
@@ -508,6 +514,8 @@ function assertNotDomainHandoff(html: string, url: string) {
 // tick the desired amenity in the filters panel, and copy the new ID from the
 // URL. Only IDs verified against public sources or live URLs are listed here.
 const AMENITY_IDS: Record<string, number> = {
+  king_bed: 1000,
+  self_checkin: 51,
   // Climate
   air_conditioning: 5,
   heating: 30,
@@ -747,7 +755,8 @@ async function handleAirbnbSearch(params: any) {
       }
       
       const clientData = JSON.parse(scriptContent);
-      const results = clientData.niobeClientData[0][1].data.presentation.staysSearch.results;
+      const results = clientData.niobeClientData?.map((entry: any) => entry?.[1]?.data?.presentation?.staysSearch?.results).find((value: any) => Array.isArray(value?.searchResults));
+      if (!results) throw new Error("Search results branch missing");
 
       // Must run before cleanObject, which strips the __typename that distinguishes
       // a discount line from a subtotal.
@@ -976,7 +985,7 @@ async function handleAirbnbListingDetails(params: any) {
       }
       
       const clientData = JSON.parse(scriptContent);
-      const sections = clientData.niobeClientData[0][1].data.presentation.stayProductDetailPage.sections.sections;
+      const sections = clientData.niobeClientData?.map((entry: any) => entry?.[1]?.data?.presentation?.stayProductDetailPage?.sections?.sections).find(Array.isArray) ?? [];
       sections.forEach((section: any) => cleanObject(section));
       
       let extracted: any[] = sections
@@ -1000,6 +1009,8 @@ async function handleAirbnbListingDetails(params: any) {
         const fromPdp: Record<string, { value: any | null; contentKey: string }> = {
           AMENITIES_DEFAULT: { value: extractAmenities(pdp), contentKey: "seeAllAmenitiesGroups" },
           HIGHLIGHTS_DEFAULT: { value: extractHighlights(pdp), contentKey: "highlights" },
+          DESCRIPTION_DEFAULT: { value: extractDescription(pdp), contentKey: "htmlDescription" },
+          POLICIES_DEFAULT: { value: extractPdpRules(pdp), contentKey: "houseRulesSections" },
         };
 
         extracted = extracted.map((section: any) => {
@@ -1058,12 +1069,14 @@ async function handleAirbnbListingDetails(params: any) {
       // so Airbnb can stub it independently of the amenities/highlights move. Without
       // this, a stubbed section silently reports success with no coordinates - the
       // exact failure mode that killed mcp.openbnb.ai.
-      const locationCoordinate = extractLocationCoordinate(findNodeLocation(clientData));
+      const locationCoordinate = extractLocationCoordinate(findNodeLocation(clientData, id));
       if (locationCoordinate) {
         const before = extracted.find((s: any) => s.id === "LOCATION_DEFAULT");
         const alreadyHadCoords = before && Number.isFinite(before.lat) && Number.isFinite(before.lng);
         extracted = recoverLocationSection(extracted, locationCoordinate);
         if (!alreadyHadCoords) recovered.push("LOCATION_DEFAULT");
+      }
+      if (pdp) {
 
         // HOST is additive (MEET_YOUR_HOST is a stub). Superhost lives on passportData.
         const host = extractHostInfo(pdp);
@@ -1191,7 +1204,7 @@ log('info', 'Airbnb MCP Server starting', {
 
 // Set up request handlers
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: AIRBNB_TOOLS,
+  tools: AIRBNB_TOOLS.map(tool => ({...tool, annotations: {readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true}})),
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -1212,6 +1225,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       arguments: request.params.arguments 
     });
     
+    const definition = AIRBNB_TOOLS.find(tool => tool.name === request.params.name);
+    if (!definition) throw new Error("Unknown tool");
+    validateInputs(request.params.arguments, definition.inputSchema);
+
     // Ensure robots.txt is loaded
     if (!robotsTxtContent && !IGNORE_ROBOTS_TXT) {
       await fetchRobotsTxt();
